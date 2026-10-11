@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 
 use super::DnssecDnsHandle;
 use crate::{
-    error::NetError,
+    error::{DnsError, NetError},
     proto::{
         dnssec::{
             DigestType, DnssecSigner, Proof, PublicKeyBuf, SigningKey, TrustAnchors,
@@ -144,6 +144,39 @@ async fn insecure_delegation_without_apex_ns() {
         .await
         .unwrap();
     assert_eq!(response.answers[0].proof, Proof::Insecure);
+}
+
+/// Failed DS queries below an insecure delegation must not prevent the zone from being
+/// recognized as insecure.
+#[tokio::test]
+async fn insecure_delegation_with_failed_ds_queries() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Insecure);
+    let child = Name::from_ascii("child.example.com.").unwrap();
+    let www = Name::from_ascii("www.child.example.com.").unwrap();
+    fixture.fail(&www, RecordType::DS);
+    fixture.fail(&child, RecordType::DS);
+    let (handle, _) = fixture.build();
+
+    let response = lookup_child_a(&handle).await.unwrap();
+    assert_eq!(response.answers[0].proof, Proof::Insecure);
+}
+
+/// Failed DS queries below a secure delegation must not be treated as an insecure delegation.
+#[tokio::test]
+async fn bogus_delegation_with_failed_ds_queries() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Secure);
+    let child = Name::from_ascii("child.example.com.").unwrap();
+    let www = Name::from_ascii("www.child.example.com.").unwrap();
+    fixture.fail(&www, RecordType::DS);
+    fixture.fail(&child, RecordType::DS);
+    let (handle, _) = fixture.build();
+
+    let response = lookup_child_a(&handle).await.unwrap();
+    assert_eq!(response.answers[0].proof, Proof::Bogus);
 }
 
 async fn lookup_child_a(handle: &DnssecDnsHandle<MockHandle>) -> Result<DnsResponse, NetError> {
@@ -282,6 +315,13 @@ impl MockHandleBuilder {
             .insert((LowerName::from(name), record_type), message);
     }
 
+    fn fail(&mut self, name: &Name, record_type: RecordType) {
+        let mut message = Message::query();
+        message.metadata.response_code = ResponseCode::ServFail;
+        self.responses
+            .insert((LowerName::from(name), record_type), message);
+    }
+
     fn build(self) -> (DnssecDnsHandle<MockHandle>, QueryLog) {
         let Self { root, responses } = self;
         let queries = QueryLog::default();
@@ -416,6 +456,12 @@ impl DnsHandle for MockHandle {
                 "no canned response for {query}"
             )))));
         };
+
+        if message.response_code != ResponseCode::NoError {
+            return Box::pin(stream::once(future::err(NetError::from(
+                DnsError::ResponseCode(message.response_code),
+            ))));
+        }
 
         let mut message = message.clone();
         message.metadata.id = request.metadata.id;
