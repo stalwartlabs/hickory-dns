@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use data_encoding::BASE32_DNSSEC;
 use futures_util::{
     future,
     stream::{self, Stream},
@@ -17,17 +18,21 @@ use time::OffsetDateTime;
 
 use super::DnssecDnsHandle;
 use crate::{
-    error::NetError,
+    error::{DnsError, NetError},
     proto::{
         dnssec::{
-            DigestType, DnssecSigner, Proof, PublicKeyBuf, SigningKey, TrustAnchors,
+            DigestType, DnssecSigner, Nsec3HashAlgorithm, Proof, PublicKeyBuf, SigningKey,
+            TrustAnchors,
             crypto::Ed25519SigningKey,
-            rdata::{DNSKEY, DNSSECRData, DS, NSEC, RRSIG},
+            rdata::{DNSKEY, DNSSECRData, DS, NSEC, NSEC3, RRSIG},
         },
         op::{DnsRequest, DnsRequestOptions, DnsResponse, Message, Query, ResponseCode},
         rr::{
             DNSClass, LowerName, Name, RData, Record, RecordSet, RecordType,
-            rdata::{A, NS, SOA},
+            rdata::{
+                A, CNAME, NS, SOA, TLSA,
+                tlsa::{CertUsage, Matching, Selector},
+            },
         },
     },
     runtime::TokioRuntimeProvider,
@@ -192,6 +197,183 @@ async fn insecure_delegation_without_apex_ns() {
     assert_eq!(response.answers[0].proof, Proof::Insecure);
 }
 
+// A CNAME'd TLSA answer (RFC 7672 3.1.2) with the target's NSEC record in the authority section.
+#[tokio::test]
+async fn positive_answer_with_unrelated_nsec() {
+    subscribe();
+
+    let fixture = MockHandleBuilder::new(Parent::Secure);
+    let target = Name::from_ascii("tlsa201._dane.example.com.").unwrap();
+    let nsec = NSEC::new(
+        Name::from_ascii("tlsa202._dane.example.com.").unwrap(),
+        [RecordType::TLSA, RecordType::RRSIG, RecordType::NSEC],
+    );
+    let authorities = fixture.sign_example([Record::from_rdata(
+        target,
+        TTL,
+        RData::DNSSEC(DNSSECRData::NSEC(nsec)),
+    )]);
+    let (handle, _) = fixture.with_cname_tlsa(authorities).build();
+
+    assert_secure(lookup_tlsa(&handle).await);
+}
+
+// Same as above, with an unrelated NSEC3 record in the authority section.
+#[tokio::test]
+async fn positive_answer_with_unrelated_nsec3() {
+    subscribe();
+
+    let fixture = MockHandleBuilder::new(Parent::Secure);
+    let owner_hash = nsec3_hash(&Name::from_ascii("tlsa201._dane.example.com.").unwrap());
+    let mut next_hash = owner_hash.clone();
+    for byte in next_hash.iter_mut().rev() {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
+            break;
+        }
+    }
+    let nsec3 = NSEC3::new(
+        Nsec3HashAlgorithm::SHA1,
+        false,
+        0,
+        Vec::new(),
+        next_hash,
+        [RecordType::TLSA, RecordType::RRSIG],
+    );
+    let owner = Name::from_ascii(BASE32_DNSSEC.encode(&owner_hash))
+        .unwrap()
+        .append_domain(fixture.example.signer_name())
+        .unwrap();
+    let authorities = fixture.sign_example([Record::from_rdata(
+        owner,
+        TTL,
+        RData::DNSSEC(DNSSECRData::NSEC3(nsec3)),
+    )]);
+    let (handle, _) = fixture.with_cname_tlsa(authorities).build();
+
+    assert_secure(lookup_tlsa(&handle).await);
+}
+
+// A wildcard expansion whose authority section only has an unrelated NSEC record.
+#[tokio::test]
+async fn wildcard_answer_with_unrelated_nsec() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Secure);
+    let authorities = fixture.unrelated_nsec();
+    let answers = fixture.wildcard_a(&wildcard_host());
+    fixture.respond(&wildcard_host(), RecordType::A, answers, authorities);
+    let (handle, _) = fixture.build();
+
+    assert_bogus(lookup(&handle, wildcard_host(), RecordType::A).await);
+}
+
+// A wildcard expansion without any denial records.
+#[tokio::test]
+async fn wildcard_answer_without_nsec() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Secure);
+    let answers = fixture.wildcard_a(&wildcard_host());
+    fixture.respond(&wildcard_host(), RecordType::A, answers, []);
+    let (handle, _) = fixture.build();
+
+    assert_bogus(lookup(&handle, wildcard_host(), RecordType::A).await);
+}
+
+// A wildcard expansion with an NSEC record covering the next closer name.
+#[tokio::test]
+async fn wildcard_answer_with_next_closer_proof() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Secure);
+    let nsec = NSEC::new(
+        Name::from_ascii("z.wild.example.com.").unwrap(),
+        [RecordType::A, RecordType::RRSIG, RecordType::NSEC],
+    );
+    let authorities = fixture.sign_example([Record::from_rdata(
+        Name::from_ascii("a.wild.example.com.").unwrap(),
+        TTL,
+        RData::DNSSEC(DNSSECRData::NSEC(nsec)),
+    )]);
+    let answers = fixture.wildcard_a(&wildcard_host());
+    fixture.respond(&wildcard_host(), RecordType::A, answers, authorities);
+    let (handle, _) = fixture.build();
+
+    assert_secure(lookup(&handle, wildcard_host(), RecordType::A).await);
+}
+
+// A wildcard-expanded CNAME, not the queried RRset itself, still needs a next closer proof.
+#[tokio::test]
+async fn wildcard_cname_with_unrelated_nsec() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Secure);
+    let target = Name::from_ascii("www.example.com.").unwrap();
+    let cname = Record::from_rdata(
+        Name::from_ascii("*.wild.example.com.").unwrap(),
+        TTL,
+        RData::CNAME(CNAME(target.clone())),
+    );
+    let mut answers = fixture.expand_wildcard(cname, &wildcard_host());
+    answers.extend(fixture.sign_example([a(&target)]));
+    let authorities = fixture.unrelated_nsec();
+    fixture.respond(&wildcard_host(), RecordType::A, answers, authorities);
+    let (handle, _) = fixture.build();
+
+    assert_bogus(lookup(&handle, wildcard_host(), RecordType::A).await);
+}
+
+fn assert_secure(result: Result<DnsResponse, NetError>) {
+    let response = result.expect("response should validate");
+    assert!(!response.answers.is_empty());
+    for record in &response.answers {
+        assert_eq!(record.proof, Proof::Secure, "{record}");
+    }
+}
+
+fn assert_bogus(result: Result<DnsResponse, NetError>) {
+    match result {
+        Err(NetError::Dns(DnsError::Nsec { proof, .. })) => assert_eq!(proof, Proof::Bogus),
+        other => panic!("expected a bogus NSEC proof, got {other:?}"),
+    }
+}
+
+fn wildcard_host() -> Name {
+    Name::from_ascii("host.wild.example.com.").unwrap()
+}
+
+fn nsec3_hash(name: &Name) -> Vec<u8> {
+    Nsec3HashAlgorithm::SHA1
+        .hash(&[], name, 0)
+        .unwrap()
+        .as_ref()
+        .to_vec()
+}
+
+async fn lookup_tlsa(handle: &DnssecDnsHandle<MockHandle>) -> Result<DnsResponse, NetError> {
+    lookup(
+        handle,
+        Name::from_ascii("_25._tcp.mx.example.com.").unwrap(),
+        RecordType::TLSA,
+    )
+    .await
+}
+
+async fn lookup(
+    handle: &DnssecDnsHandle<MockHandle>,
+    name: Name,
+    record_type: RecordType,
+) -> Result<DnsResponse, NetError> {
+    handle
+        .lookup(
+            Query::query(name, record_type),
+            DnsRequestOptions::default(),
+        )
+        .first_answer()
+        .await
+}
+
 async fn lookup_child_a(handle: &DnssecDnsHandle<MockHandle>) -> Result<DnsResponse, NetError> {
     let name = Name::from_ascii("www.child.example.com.").unwrap();
     handle
@@ -212,6 +394,7 @@ async fn lookup_child_a(handle: &DnssecDnsHandle<MockHandle>) -> Result<DnsRespo
 /// `example.com.` zone's records are unsigned.
 struct MockHandleBuilder {
     root: DnssecSigner,
+    example: DnssecSigner,
     responses: HashMap<(LowerName, RecordType), Message>,
 }
 
@@ -227,8 +410,19 @@ impl MockHandleBuilder {
             Duration::from_secs(86400),
         );
 
+        let key =
+            Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().unwrap()).unwrap();
+        let example_public_key = key.to_public_key().unwrap();
+        let example = DnssecSigner::new(
+            DNSKEY::from_key(&example_public_key),
+            Box::new(key),
+            Name::from_ascii("example.com.").unwrap(),
+            Duration::from_secs(86400),
+        );
+
         let mut new = Self {
             root,
+            example,
             responses: HashMap::default(),
         };
 
@@ -242,16 +436,7 @@ impl MockHandleBuilder {
             Duration::from_secs(86400),
         );
 
-        let key =
-            Ed25519SigningKey::from_pkcs8(&Ed25519SigningKey::generate_pkcs8().unwrap()).unwrap();
-        let example_public_key = key.to_public_key().unwrap();
-        let example = DnssecSigner::new(
-            DNSKEY::from_key(&example_public_key),
-            Box::new(key),
-            Name::from_ascii("example.com.").unwrap(),
-            Duration::from_secs(86400),
-        );
-
+        let example = new.example.signer_name().clone();
         let child = Name::from_ascii("child.example.com.").unwrap();
         let www = Name::from_ascii("www.child.example.com.").unwrap();
 
@@ -273,19 +458,14 @@ impl MockHandleBuilder {
             sign([dnskey(&com)], &com),
             [],
         );
-        new.respond(
-            example.signer_name(),
-            RecordType::NS,
-            [ns(example.signer_name())],
-            [],
-        );
+        new.respond(&example, RecordType::NS, [ns(&example)], []);
 
         match parent {
             Parent::Insecure => {
                 let mut authorities = sign([unsigned_soa(com.signer_name())], &com);
                 authorities.extend(sign(
                     [Record::from_rdata(
-                        example.signer_name().clone(),
+                        example.clone(),
                         TTL,
                         RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(
                             Name::from_ascii("example0.com.").unwrap(),
@@ -294,15 +474,13 @@ impl MockHandleBuilder {
                     )],
                     &com,
                 ));
-                new.respond(example.signer_name(), RecordType::DS, [], authorities);
+                new.respond(&example, RecordType::DS, [], authorities);
             }
             Parent::Secure => {
-                new.respond(
-                    example.signer_name(),
-                    RecordType::DS,
-                    sign([ds(&example, &example_public_key)], &com),
-                    [],
-                );
+                let records = sign([ds(&new.example, &example_public_key)], &com);
+                new.respond(&example, RecordType::DS, records, []);
+                let records = sign([dnskey(&new.example)], &new.example);
+                new.respond(&example, RecordType::DNSKEY, records, []);
             }
         }
 
@@ -328,8 +506,63 @@ impl MockHandleBuilder {
             .insert((LowerName::from(name), record_type), message);
     }
 
+    fn sign_example(&self, records: impl IntoIterator<Item = Record>) -> Vec<Record> {
+        sign(records, &self.example)
+    }
+
+    /// Sign a record owned by a wildcard name, and rename it as if it were expanded to `name`.
+    fn expand_wildcard(&self, record: Record, name: &Name) -> Vec<Record> {
+        let mut records = self.sign_example([record]);
+        for record in &mut records {
+            record.name = name.clone();
+        }
+        records
+    }
+
+    fn wildcard_a(&self, name: &Name) -> Vec<Record> {
+        self.expand_wildcard(a(&Name::from_ascii("*.wild.example.com.").unwrap()), name)
+    }
+
+    fn unrelated_nsec(&self) -> Vec<Record> {
+        let nsec = NSEC::new(
+            Name::from_ascii("tlsa202._dane.example.com.").unwrap(),
+            [RecordType::TLSA, RecordType::RRSIG, RecordType::NSEC],
+        );
+        self.sign_example([Record::from_rdata(
+            Name::from_ascii("tlsa201._dane.example.com.").unwrap(),
+            TTL,
+            RData::DNSSEC(DNSSECRData::NSEC(nsec)),
+        )])
+    }
+
+    /// Answer `_25._tcp.mx.example.com. TLSA` with a CNAME to `tlsa201._dane.example.com.` and
+    /// the TLSA record at the target.
+    fn with_cname_tlsa(mut self, authorities: Vec<Record>) -> Self {
+        let alias = Name::from_ascii("_25._tcp.mx.example.com.").unwrap();
+        let target = Name::from_ascii("tlsa201._dane.example.com.").unwrap();
+        let mut answers = self.sign_example([Record::from_rdata(
+            alias.clone(),
+            TTL,
+            RData::CNAME(CNAME(target.clone())),
+        )]);
+        answers.extend(self.sign_example([Record::from_rdata(
+            target,
+            TTL,
+            RData::TLSA(TLSA::new(
+                CertUsage::DaneEe,
+                Selector::Spki,
+                Matching::Sha256,
+                vec![0; 32],
+            )),
+        )]));
+        self.respond(&alias, RecordType::TLSA, answers, authorities);
+        self
+    }
+
     fn build(self) -> (DnssecDnsHandle<MockHandle>, QueryLog) {
-        let Self { root, responses } = self;
+        let Self {
+            root, responses, ..
+        } = self;
         let queries = QueryLog::default();
         let handle = MockHandle {
             responses: Arc::new(responses),
