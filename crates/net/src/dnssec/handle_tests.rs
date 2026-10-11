@@ -120,6 +120,32 @@ async fn bogus_delegation_with_empty_ds_response() {
     assert_eq!(response.answers[0].proof, Proof::Bogus);
 }
 
+/// A zone without NS records at its apex must not be mistaken for part of its signed parent zone.
+///
+/// Regression test for <https://github.com/hickory-dns/hickory-dns/issues/4027>.
+#[tokio::test]
+async fn insecure_delegation_without_apex_ns() {
+    subscribe();
+
+    let mut fixture = MockHandleBuilder::new(Parent::Insecure);
+    let com = Name::from_ascii("com.").unwrap();
+    let example = Name::from_ascii("example.com.").unwrap();
+    let www = Name::from_ascii("www.example.com.").unwrap();
+    fixture.respond(&com, RecordType::NS, [ns(&com)], []);
+    fixture.respond(&example, RecordType::NS, [], [unsigned_soa(&example)]);
+    fixture.respond(&www, RecordType::NS, [], [unsigned_soa(&example)]);
+    fixture.respond(&www, RecordType::DS, [], [unsigned_soa(&example)]);
+    fixture.respond(&www, RecordType::A, [a(&www)], []);
+    let (handle, _) = fixture.build();
+
+    let response = handle
+        .lookup(Query::new(www, RecordType::A), DnsRequestOptions::default())
+        .first_answer()
+        .await
+        .unwrap();
+    assert_eq!(response.answers[0].proof, Proof::Insecure);
+}
+
 async fn lookup_child_a(handle: &DnssecDnsHandle<MockHandle>) -> Result<DnsResponse, NetError> {
     let name = Name::from_ascii("www.child.example.com.").unwrap();
     handle
@@ -236,6 +262,7 @@ impl MockHandleBuilder {
 
         new.respond(&child, RecordType::NS, [ns(&child)], []);
         new.respond(&www, RecordType::NS, [], []);
+        new.respond(&www, RecordType::DS, [], [unsigned_soa(&child)]);
         new.respond(&www, RecordType::A, [a(&www)], []);
         new
     }

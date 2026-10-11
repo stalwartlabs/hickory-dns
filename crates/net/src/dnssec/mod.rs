@@ -661,55 +661,63 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
     /// Returns an error with an `Insecure` proof if the zone is proven to be insecure. Returns
     /// `Ok(())` if the zone is secure.
     ///
-    /// This first finds the nearest zone cut at or above the given name, by making NS queries.
-    /// Then, the DS RRset at the delegation point is requested. The DS response is validated to
+    /// This requests the DS RRset at the given name and then at each of its ancestors, until one
+    /// is found or a delegation is proven to be insecure. The DS responses are validated to
     /// determine if any DS records exist or not, and thus whether the zone is secure, insecure, or
-    /// bogus. See [RFC 6840 section 6.1](https://datatracker.ietf.org/doc/html/rfc6840#section-6.1)
-    /// and [RFC 4035 section 4.2](https://datatracker.ietf.org/doc/html/rfc4035#section-4.2).
+    /// bogus. Zone cuts are not discovered with NS queries, because some zones lack NS records at
+    /// their apex.
     async fn find_ds_records(
         &self,
         name: Name,
         options: DnsRequestOptions,
     ) -> Result<(), ProofError> {
         let mut ancestor = name.clone();
-        let zone = loop {
+        loop {
             if ancestor.is_root() {
                 return Err(ProofError::ds_should_exist(name));
             }
 
-            // Make an un-verified request for the NS RRset at this ancestor name.
-            let query = Query::new(ancestor.clone(), RecordType::NS);
-            let result = self
-                .handle
-                .lookup(query.clone(), options)
-                .first_answer()
-                .await;
-            match result {
-                Ok(response) => {
-                    if response.all_sections().any(|record| {
-                        record.record_type() == RecordType::NS && record.name == ancestor
-                    }) {
-                        break ancestor;
-                    }
-                }
-                Err(e) if e.is_no_records_found() || e.is_nx_domain() => {}
-                Err(net) => {
-                    return Err(ProofError::new(
-                        Proof::Bogus,
-                        ProofErrorKind::Net { query, net },
-                    ));
-                }
+            match self.lookup_ds_records(ancestor.clone(), options).await {
+                Ok(_) => return Ok(()),
+                Err(err) if matches!(err.kind(), ProofErrorKind::DsRecordShouldExist { .. }) => {}
+                Err(err) => return Err(err),
             }
 
             ancestor = ancestor.base_name();
-        };
-
-        self.fetch_ds_records(zone, options).await?;
-        Ok(())
+        }
     }
 
     /// Retrieves DS records for the given zone.
     async fn fetch_ds_records(
+        &self,
+        zone: Name,
+        options: DnsRequestOptions,
+    ) -> Result<Vec<Record<DS>>, ProofError> {
+        let err = match self.lookup_ds_records(zone.clone(), options).await {
+            Err(err) if matches!(err.kind(), ProofErrorKind::DsRecordShouldExist { .. }) => err,
+            result => return result,
+        };
+
+        // The response does not contain any records that could carry an insecure proof (some
+        // servers return an empty authority section for DS queries in insecure zones). Check
+        // whether the parent zone is insecure directly instead.
+        match Box::pin(self.find_ds_records(zone.base_name(), options)).await {
+            Err(parent) if parent.proof == Proof::Insecure => {
+                debug!(
+                    %zone,
+                    "marking zone as insecure based on insecure parent zone lookup",
+                );
+                Err(ProofError::new(
+                    Proof::Insecure,
+                    ProofErrorKind::DsResponseInsecure { name: zone },
+                ))
+            }
+            Ok(()) | Err(_) => Err(err),
+        }
+    }
+
+    /// Retrieves DS records for the given zone, without checking ancestors of the zone.
+    async fn lookup_ds_records(
         &self,
         zone: Name,
         options: DnsRequestOptions,
@@ -864,24 +872,6 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
                 Proof::Insecure,
                 ProofErrorKind::DsResponseInsecure { name: zone },
             ));
-        }
-
-        // Case 5: The response does not contain any records that could carry an
-        // insecure proof (some servers return an empty authority section for DS
-        // queries in insecure zones). Check whether the parent zone is insecure
-        // directly instead.
-        match Box::pin(self.find_ds_records(zone.base_name(), options)).await {
-            Err(err) if err.proof == Proof::Insecure => {
-                debug!(
-                    %zone,
-                    "marking zone as insecure based on insecure parent zone lookup",
-                );
-                return Err(ProofError::new(
-                    Proof::Insecure,
-                    ProofErrorKind::DsResponseInsecure { name: zone },
-                ));
-            }
-            Ok(()) | Err(_) => {}
         }
 
         debug!(
