@@ -791,22 +791,27 @@ impl<H: DnsHandle> DnssecDnsHandle<H> {
     /// is found or a delegation is proven to be insecure. The DS responses are validated to
     /// determine if any DS records exist or not, and thus whether the zone is secure, insecure, or
     /// bogus. Zone cuts are not discovered with NS queries, because some zones lack NS records at
-    /// their apex.
+    /// their apex. Failed DS lookups do not stop the search, because some servers fail DS queries
+    /// for names in unsigned zones; an insecure result still requires a validated proof.
     async fn find_ds_records(
         &self,
         name: Name,
         options: DnsRequestOptions,
     ) -> Result<(), ProofError> {
         let mut ancestor = name.clone();
+        let mut first_error = None;
         loop {
             if ancestor.is_root() {
-                return Err(ProofError::ds_should_exist(name));
+                return Err(first_error.unwrap_or_else(|| ProofError::ds_should_exist(name)));
             }
 
             match self.lookup_ds_records(ancestor.clone(), options).await {
                 Ok(_) => return Ok(()),
+                Err(err) if err.proof == Proof::Insecure => return Err(err),
                 Err(err) if matches!(err.kind(), ProofErrorKind::DsRecordShouldExist { .. }) => {}
-                Err(err) => return Err(err),
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
             }
 
             ancestor = ancestor.base_name();

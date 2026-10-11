@@ -1152,9 +1152,9 @@ mod metrics {
 
         #[cfg(feature = "__dnssec")]
         {
-            assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, vec![], 6);
+            assert_counter_eq(&map, OUTGOING_QUERIES_TOTAL, vec![], 9);
             assert_counter_eq(&map, CACHE_HIT_TOTAL, vec![], 4);
-            assert_counter_eq(&map, CACHE_MISS_TOTAL, vec![], 4);
+            assert_counter_eq(&map, CACHE_MISS_TOTAL, vec![], 7);
             assert_histogram_sample_count_eq(&map, CACHE_HIT_DURATION, vec![], 2, Unit::Seconds);
             assert_histogram_sample_count_eq(&map, CACHE_MISS_DURATION, vec![], 1, Unit::Seconds);
 
